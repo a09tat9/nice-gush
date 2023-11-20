@@ -1,0 +1,226 @@
+import jwt
+import hashlib
+import os
+import requests
+import uuid
+import pyupbit
+from binance.client import Client
+import datetime
+import time
+import asyncio
+from telegram import Bot
+import winsound  # Added for playing alarm sound
+    
+# Upbit과 Binance의 가격 비교
+exclusion_set_upbit = {"BTG","BTT"}  
+exclusion_set_bithumb = {"BTC","EGG","BTT","NFT","PEPE"}  
+
+def play_alarm_sound():
+    # Adjust the file path to the alarm sound file on your computer
+    sound_file_path = r"C:\Users\MAIN\Desktop\ditto.m4a"
+    winsound.PlaySound(sound_file_path, winsound.SND_FILENAME)
+
+
+url = "https://api.bithumb.com/public/assetsstatus/ALL"
+headers = {"accept": "application/json"}
+
+response = requests.get(url, headers=headers)
+data = response.json()
+
+# Dynamic exclusion set based on deposit_status
+dynamic_exclusion_set = {currency for currency, status in data['data'].items() if status.get('deposit_status') == 0}
+
+# Telegram Bot Configuration
+bot_token = '5680614175:AAFReJX_IjbRsSz_wmrOH6JpTlDl4uM5yZQ'
+chat_id = '1719125263'
+
+async def send_telegram_message(text):
+    try:
+        bot = Bot(token=bot_token)
+        await bot.send_message(chat_id=chat_id, text=text)
+    except Exception as e:
+        print(f"Telegram Error: {e}")
+
+
+# Combine both sets
+exclusion_set_bithumb |= dynamic_exclusion_set
+
+access_key = os.environ['UPBIT_OPEN_API_ACCESS_KEY']
+secret_key = os.environ['UPBIT_OPEN_API_SECRET_KEY']
+server_url = 'https://api.upbit.com/v1/status/wallet'
+
+payload = {
+    'access_key': access_key,
+    'nonce': str(uuid.uuid4()),
+}
+
+jwt_token = jwt.encode(payload, secret_key)
+authorization = 'Bearer {}'.format(jwt_token)
+headers = {
+    'Authorization': authorization,
+}
+
+res = requests.get(server_url, headers=headers)
+res_json = res.json()
+
+
+# Dynamic exclusion set
+dynamic_exclusion_set = {item['currency'] for item in res_json if item.get('wallet_state') != 'working'} if isinstance(res_json, list) else set()
+
+# Combine both sets
+exclusion_set_upbit |= dynamic_exclusion_set
+
+
+# Binance 설정
+api_key_binance = "YOUR_BINANCE_API_KEY"
+api_secret_binance = "YOUR_BINANCE_API_SECRET"
+client_binance = Client(api_key_binance, api_secret_binance)
+
+# Upbit 설정
+upbit_tickers_krw = pyupbit.get_tickers(fiat="KRW")
+
+# Gate.io 설정
+host_gate = "https://api.gateio.ws"
+prefix_gate = "/api/v4"
+headers_gate = {'Accept': 'application/json', 'Content-Type': 'application/json'}
+url_gate = '/spot/tickers'
+query_param_gate = ''
+
+# Bithumb 설정
+url_bithumb = "https://api.bithumb.com/public/ticker/ALL_KRW"
+headers_bithumb = {"accept": "application/json"}
+
+# 기준환율 변수 초기화
+base_exchange_rate = 0.0
+
+def get_prices(exchange_name, fiat):
+    try:
+        if exchange_name == 'Binance':
+            ticker_prices = client_binance.get_all_tickers()
+            prices = {ticker['symbol'][:-4]: float(ticker['price']) for ticker in ticker_prices if ticker['symbol'].endswith('USDT')}
+        elif exchange_name == 'Gate.io':
+            r_gate = requests.request('GET', host_gate + prefix_gate + url_gate, headers=headers_gate)
+            data_gate = r_gate.json()
+            if isinstance(data_gate, list) and len(data_gate) > 0:
+                exclude_list = {'BTC'}
+                filtered_data_gate = [item for item in data_gate if item['currency_pair'].endswith('_USDT') and item['currency_pair'][:-5] not in exclude_list]
+                prices = {item['currency_pair'][:-5]: item['last'] for item in filtered_data_gate}
+            else:
+                print("Gate.io: 잘못된 응답 형식.")
+                prices = {}
+        elif exchange_name == 'Upbit':
+            prices = {symbol.replace(f"{fiat}-", ''): price for symbol, price in pyupbit.get_current_price(pyupbit.get_tickers(fiat=fiat)).items()}
+        elif exchange_name == 'Bithumb':
+            response = requests.get(url_bithumb, headers=headers_bithumb)
+            data = response.json()["data"]
+            exclude_list = []
+            prices = {symbol: {"closing_price": coin_data["closing_price"]} for symbol, coin_data in data.items() if symbol != "date" and symbol not in exclude_list}
+        else:
+            print("Unsupported exchange.")
+            prices = {}
+        
+        return prices
+    except Exception as e:
+        print(f"{exchange_name} 에러: {e}")
+        return {}
+
+def calculate_base_exchange_rate(prices_binance, prices_upbit):
+    global base_exchange_rate
+    try:
+        # Upbit에서의 BTC 가격을 Binance에서의 BTC 가격으로 나누어 기준환율 계산
+        base_exchange_rate = prices_upbit.get('BTC', 0) / prices_binance.get('BTC', 1)
+    except Exception as e:
+        print(f"환율 계산 에러: {e}")
+
+def convert_prices_to_krw(exchange_name, prices):
+    try:
+        # 환율을 기준으로 가격 변환
+        converted_prices = {}
+
+        if exchange_name == 'Binance':
+            for symbol, price in prices.items():
+                converted_price = float(price) * base_exchange_rate
+                converted_prices[symbol] = converted_price
+        elif exchange_name == 'Gate.io':
+            # 게이트의 가격을 변환
+            for symbol, price in prices.items():
+                converted_price = float(price) * base_exchange_rate
+                converted_prices[symbol] = converted_price
+        else:
+            # Upbit와 Bithumb은 변환하지 않고 그대로 저장
+            converted_prices = prices
+
+        # Print only if the exchange is not 'Binance' or 'Gate.io'
+        if exchange_name not in ['Binance', 'Gate.io']:
+            print(f"=== {exchange_name} 가격 in KRW ===")
+            print(converted_prices)
+            print(f"{exchange_name} 가격 수 in KRW:", len(converted_prices))
+
+        return converted_prices
+    except Exception as e:
+        print(f"가격 변환 에러: {e}")
+        return {}
+
+if __name__ == "__main__":
+    printed_symbols = {}  # Dictionary to track symbols and their last printed time
+
+    try:
+        while True:
+            prices_binance = get_prices('Binance', 'USDT')
+            prices_gate = get_prices('Gate.io', 'USDT')
+            prices_upbit = get_prices('Upbit', 'KRW')
+            prices_bithumb = get_prices('Bithumb', 'KRW')
+
+            calculate_base_exchange_rate(prices_binance, prices_upbit)
+
+            # Binance, Gate.io만 변환 작업 수행
+            converted_prices_binance = convert_prices_to_krw('Binance', prices_binance)
+            converted_prices_gate = convert_prices_to_krw('Gate.io', prices_gate)
+
+            current_data = {
+                'timestamp': datetime.datetime.now(),
+                'upbit_prices': prices_upbit.copy(),  # Store a copy to keep the original data
+                'converted_prices_binance': converted_prices_binance.copy(),
+                'converted_prices_gate': converted_prices_gate.copy()
+            }
+
+            for symbol, upbit_price in prices_upbit.items():
+                if symbol in converted_prices_binance and symbol not in exclusion_set_upbit:
+                    binance_price = converted_prices_binance[symbol]
+                    price_difference_percent = ((upbit_price - binance_price) / binance_price) * 100
+
+                    # Check if the symbol was already printed in the last minute
+                    last_printed_time = printed_symbols.get(symbol, datetime.datetime.min)
+                    elapsed_time = (current_data['timestamp'] - last_printed_time).total_seconds()
+
+                    if elapsed_time > 60:
+                        if abs(price_difference_percent) > 2:
+                            message = f"{symbol}: Upbit Price - {upbit_price}, Binance Price - {binance_price}, Difference - {price_difference_percent:.2f}%"
+                            print(message)
+                            play_alarm_sound()  # Play alarm sound
+                            asyncio.run(send_telegram_message(message))
+                            printed_symbols[symbol] = current_data['timestamp']  # Update the last printed time
+
+            # Bithumb과 Gate.io의 가격 비교
+            for symbol, bithumb_price_data in prices_bithumb.items():
+                if symbol in converted_prices_gate and symbol not in exclusion_set_bithumb:
+                    converted_gate_price = converted_prices_gate[symbol]
+                    bithumb_price = float(bithumb_price_data["closing_price"])  # Convert to float
+                    price_difference_percent = ((converted_gate_price - bithumb_price) / bithumb_price) * 100
+
+                    # Check if the symbol was already printed in the last minute
+                    last_printed_time = printed_symbols.get(symbol, datetime.datetime.min)
+                    elapsed_time = (current_data['timestamp'] - last_printed_time).total_seconds()
+
+                    if elapsed_time > 60:
+                        if abs(price_difference_percent) > 2:
+                            message = f"{symbol}: Bithumb Price - {bithumb_price}, Gate.io Converted Price - {converted_gate_price}, Difference - {price_difference_percent:.2f}%"
+                            print(message)
+                            play_alarm_sound()  # Play alarm sound
+                            asyncio.run(send_telegram_message(message))
+                            printed_symbols[symbol] = current_data['timestamp']  # Update the last printed time
+
+            time.sleep(5)  # Wait for 3 seconds before the next iteration
+
+    except Exception as e:
+        print(f"에러 발생: {e}")
